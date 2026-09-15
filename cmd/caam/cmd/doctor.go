@@ -903,37 +903,6 @@ func checkLocks(fix bool) []CheckResult {
 	return results
 }
 
-// checkClaudeKeychain reports the state of the macOS login keychain item
-// Claude Code stores its OAuth tokens in. It returns nil off macOS, where
-// there is no keychain and the credentials file is the only source.
-func checkClaudeKeychain() *CheckResult {
-	if runtime.GOOS != "darwin" {
-		return nil
-	}
-	name := "claude keychain"
-	if !keychain.Available() {
-		return &CheckResult{
-			Name:    name,
-			Status:  "warn",
-			Message: "keychain unreachable",
-			Details: "caam cannot read " + keychain.ClaudeService + "; account switching will fall back to ~/.claude/.credentials.json, which Claude Code ignores on macOS",
-		}
-	}
-	if _, ok := keychain.ClaudeCredentials(); !ok {
-		return &CheckResult{
-			Name:    name,
-			Status:  "warn",
-			Message: "no Claude credentials in the login keychain",
-			Details: "run /login inside claude, then 'caam backup claude <name>' to capture the account",
-		}
-	}
-	return &CheckResult{
-		Name:    name,
-		Status:  "pass",
-		Message: "credentials in the login keychain (" + keychain.ClaudeService + "), mirrored for caam",
-	}
-}
-
 func checkAuthFiles() []CheckResult {
 	var results []CheckResult
 
@@ -947,8 +916,8 @@ func checkAuthFiles() []CheckResult {
 		return results
 	}
 
-	if kc := checkClaudeKeychain(); kc != nil {
-		results = append(results, *kc)
+	if result := checkClaudeKeychain(); result != nil {
+		results = append(results, *result)
 	}
 
 	for tool, getFileSet := range tools {
@@ -1038,6 +1007,37 @@ func checkAuthFiles() []CheckResult {
 // identityFromJWT returns "email|accountID|org" — this extracts the email,
 // falling back to accountID if email is empty.
 // Plain email strings are returned lowercased as-is.
+// checkClaudeKeychain reports on the macOS login-keychain bridge. On a Mac the
+// live Claude OAuth token is a keychain item, not a file, and a keychain caam
+// cannot read means backup captures a token-less profile and activate is a
+// silent no-op (issue #98). Off darwin, and with the bridge switched off,
+// there is nothing to report.
+func checkClaudeKeychain() *CheckResult {
+	if !keychain.Enabled() {
+		return nil
+	}
+	check := &CheckResult{Name: "claude keychain"}
+	switch _, err := keychain.ReadClaude(); {
+	case err == nil:
+		check.Status = "pass"
+		check.Message = fmt.Sprintf("%q readable in the login keychain", keychain.ClaudeService)
+	case errors.Is(err, keychain.ErrNoKeychain):
+		return nil
+	case errors.Is(err, keychain.ErrNotFound):
+		check.Status = "warn"
+		check.Message = "no Claude item in the login keychain"
+		check.Details = "Claude Code stores its OAuth token there on macOS; log in with 'claude' before 'caam backup claude <profile>'"
+	case errors.Is(err, keychain.ErrDenied):
+		check.Status = "fail"
+		check.Message = "the login keychain refused access"
+		check.Details = "Unlock the login keychain and allow access when prompted, or set CAAM_KEYCHAIN=0 to fall back to ~/.claude/.credentials.json"
+	default:
+		check.Status = "fail"
+		check.Message = err.Error()
+	}
+	return check
+}
+
 func normalizeIdentity(id string) string {
 	if id == "" {
 		return ""

@@ -403,10 +403,6 @@ func (v *Vault) BackupPath(tool, profile, filename string) string {
 
 // Backup saves the current auth files to the vault.
 func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
-	// macOS keeps Claude's tokens in the keychain; mirror them into the
-	// credentials file first or the snapshot captures no credentials at all.
-	syncClaudeKeychainIn(fileSet)
-
 	profileDir, err := v.safeProfileDir(fileSet.Tool, profile)
 	if err != nil {
 		return err
@@ -427,6 +423,14 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("stat profile dir: %w", err)
 		}
+	}
+
+	// On macOS the live Claude credentials are in the login keychain, not on
+	// disk. Mirror them out before the walk below, or the snapshot captures
+	// settings with no token in them (issue #98). A refused keychain is fatal
+	// here: a token-less profile is worse than a failed backup.
+	if err := pullClaudeKeychain(fileSet); err != nil {
+		return err
 	}
 
 	// Create profile directory
@@ -774,10 +778,6 @@ func MigrateGeminiVaultDir(dir string) error {
 
 // Restore copies backed-up auth files to their original locations.
 func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
-	// The freshness guards below compare the snapshot against live state, so
-	// the live credentials file has to reflect the keychain before they run.
-	syncClaudeKeychainIn(fileSet)
-
 	profileDir, err := v.safeProfileDir(fileSet.Tool, profile)
 	if err != nil {
 		return err
@@ -792,6 +792,14 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		if err := MigrateGeminiVaultDir(profileDir); err != nil {
 			return fmt.Errorf("vault migration (oauth_credentials.json -> oauth_creds.json): %w", err)
 		}
+	}
+
+	// Mirror the login keychain onto disk first: on macOS it, not the file, is
+	// what the freshness guard below must compare the snapshot against, and a
+	// keychain caam cannot read is one it cannot write either — better to stop
+	// than to report a switch that did not happen (issue #98).
+	if err := pullClaudeKeychain(fileSet); err != nil {
+		return err
 	}
 
 	// Capture the live Claude identity BEFORE any file is overwritten: the
@@ -915,10 +923,9 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		}
 	}
 
-	// On macOS the restored file is inert until it reaches the keychain, which
-	// is where Claude Code reads from. Fail loudly: a swallowed error here
-	// leaves the previous account live while caam reports a successful switch.
-	if err := syncClaudeKeychainOut(fileSet); err != nil {
+	// The restored file only becomes the account Claude Code uses once it is
+	// back in the login keychain (issue #98).
+	if err := pushClaudeKeychain(fileSet); err != nil {
 		return err
 	}
 
@@ -1074,7 +1081,10 @@ func (v *Vault) CopyProfile(tool, srcProfile, dstProfile string) error {
 // hashed so that volatile metadata (e.g., changelogLastFetched, numStartups)
 // does not break profile detection.
 func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
-	syncClaudeKeychainIn(fileSet)
+	// Best-effort: on macOS the live token is in the keychain, so without the
+	// mirror the hash comparison below has nothing to compare (issue #98).
+	// A refused keychain leaves detection where it was before the bridge.
+	_ = pullClaudeKeychain(fileSet)
 
 	profiles, err := v.List(fileSet.Tool)
 	if err != nil {
@@ -1172,7 +1182,10 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 
 // HasAuthFiles checks if the tool currently has auth files present.
 func HasAuthFiles(fileSet AuthFileSet) bool {
-	syncClaudeKeychainIn(fileSet)
+	// Best-effort mirror: a macOS Claude login lives in the keychain, and
+	// reporting "not logged in" for it would send callers down the login path
+	// (issue #98).
+	_ = pullClaudeKeychain(fileSet)
 
 	optionalFound := false
 	for _, spec := range fileSet.Files {
@@ -1212,6 +1225,9 @@ func ClearAuthFiles(fileSet AuthFileSet) error {
 			return fmt.Errorf("remove %s: %w", spec.Path, err)
 		}
 	}
+
+	// Removing the mirror is not a logout while the keychain still holds the
+	// token Claude Code prefers (issue #98).
 	return clearClaudeKeychain(fileSet)
 }
 

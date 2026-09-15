@@ -565,9 +565,10 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		return nil, fmt.Errorf("get home dir: %w", err)
 	}
 
-	// On macOS the OAuth tokens live in the login keychain, not on disk;
-	// mirror them into the credentials file so the scan below can see them.
-	keychain.MirrorClaudeCredentials(filepath.Join(homeDir, ".claude", ".credentials.json"))
+	// On macOS the OAuth blob lives in the login keychain; ~/.claude/.credentials.json
+	// is its mirror. Refresh it or detection reports "no credentials found"
+	// for a perfectly good login (issue #98).
+	_, _ = keychain.EnsureMirror(filepath.Join(homeDir, ".claude", ".credentials.json"))
 
 	// Define locations to check
 	locations := []struct {

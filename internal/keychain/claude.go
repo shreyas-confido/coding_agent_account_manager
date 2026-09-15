@@ -1,143 +1,194 @@
 package keychain
 
 import (
-	"encoding/json"
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 )
 
-// ClaudeService is the generic-password service name Claude Code uses for its
-// OAuth credentials on macOS. The account attribute is the login name (see
-// CurrentAccount), and the secret is byte-for-byte the same JSON document that
-// Claude Code writes to ~/.claude/.credentials.json on platforms without a
-// keychain: {"claudeAiOauth":{"accessToken":...,"refreshToken":...}}.
+// ClaudeService is the generic-password service name Claude Code files its
+// OAuth blob under in the macOS login keychain.
 const ClaudeService = "Claude Code-credentials"
 
-// ClaudeCredentials returns the credential blob currently in the keychain.
-// ok is false when the bridge is unavailable, no item exists, or the item does
-// not hold JSON (a value caam must not copy into a credentials file).
-func ClaudeCredentials() (data []byte, ok bool) {
-	if !Available() {
+// ReadClaude returns the Claude Code OAuth blob from the login keychain.
+//
+// It looks for the login user's item first and falls back to a service-only
+// match, so a keychain written under a different account name (a migrated home
+// directory, a renamed user) is still found.
+func ReadClaude() ([]byte, error) {
+	account := LoginAccount()
+	secret, err := Get(ClaudeService, account)
+	if errors.Is(err, ErrNotFound) && account != "" {
+		secret, err = Get(ClaudeService, "")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !validJSONObject(secret) {
+		return nil, fmt.Errorf("keychain: item %q does not hold a JSON object", ClaudeService)
+	}
+	return secret, nil
+}
+
+// WriteClaude stores blob as the Claude Code OAuth item, replacing whatever is
+// there. blob must be the JSON object Claude Code expects.
+func WriteClaude(blob []byte) error {
+	if !validJSONObject(blob) {
+		return errors.New("keychain: refusing to store credentials that are not a JSON object")
+	}
+	account := LoginAccount()
+	if account == "" {
+		return errors.New("keychain: cannot determine the login user name")
+	}
+	return Set(ClaudeService, account, blob)
+}
+
+// DeleteClaude removes the Claude Code OAuth item. A missing item, or no
+// keychain at all, is not an error.
+func DeleteClaude() error {
+	ForgetMirrors()
+	if err := Delete(ClaudeService, LoginAccount()); err != nil {
+		return err
+	}
+	// A service-only sweep catches an item filed under another account name.
+	return Delete(ClaudeService, "")
+}
+
+// EnsureMirror refreshes credPath from the login keychain so the file-shaped
+// code paths (hashing, identity, expiry) see the credentials that are actually
+// in force. The file is written 0600, atomically, and only when its contents
+// differ from the keychain.
+//
+// It reports whether the mirror was written. ErrNoKeychain and ErrNotFound are
+// returned as-is: they mean "nothing to bridge here" (a non-darwin host, an
+// isolated HOME, or a login that predates the keychain), and every caller but
+// backup treats them as a no-op.
+func EnsureMirror(credPath string) (bool, error) {
+	if !Enabled() {
+		return false, ErrNoKeychain
+	}
+	if err, ok := cachedMirror(credPath); ok {
+		// The mirror was refreshed a moment ago, so nothing was written now.
+		return false, err
+	}
+	wrote, err := ensureMirror(credPath)
+	rememberMirror(credPath, err)
+	return wrote, err
+}
+
+// mirrorTTL is how long a mirror refresh is assumed to still hold. A keychain
+// lookup costs a few hundred milliseconds and a single command can reach
+// HasAuthFiles and ActiveProfile many times over; without the memo a `caam
+// status` would spend seconds in /usr/bin/security. Short enough that a
+// long-lived daemon still sees a rotated token promptly.
+const mirrorTTL = 3 * time.Second
+
+type mirrorResult struct {
+	at  time.Time
+	err error
+}
+
+var (
+	mirrorMu    sync.Mutex
+	mirrorCache = map[string]mirrorResult{}
+)
+
+func cachedMirror(credPath string) (err error, ok bool) {
+	mirrorMu.Lock()
+	defer mirrorMu.Unlock()
+	res, hit := mirrorCache[credPath]
+	if !hit || time.Since(res.at) > mirrorTTL {
 		return nil, false
 	}
-	data, err := Get(ClaudeService, CurrentAccount())
-	if err != nil || len(data) == 0 || !json.Valid(data) {
-		return nil, false
-	}
-	return data, true
+	return res.err, true
 }
 
-// MirrorClaudeCredentials copies the keychain item into path, the plaintext
-// credentials file the rest of caam treats as the source of truth (hashing,
-// identity extraction, active-profile detection, expiry checks).
-//
-// The keychain is authoritative on macOS: Claude Code rotates the tokens there
-// in place, so the mirror is rewritten whenever the two differ, and a stale
-// mirror never wins. Returns true when path now matches the keychain.
-func MirrorClaudeCredentials(path string) bool {
-	if path == "" {
-		return false
-	}
-	data, ok := ClaudeCredentials()
-	if !ok {
-		return false
-	}
-	if existing, err := os.ReadFile(path); err == nil && bytesEqualJSON(existing, data) {
-		return true
-	}
-	if err := writeSecretFile(path, data); err != nil {
-		return false
-	}
-	return true
+func rememberMirror(credPath string, err error) {
+	mirrorMu.Lock()
+	defer mirrorMu.Unlock()
+	mirrorCache[credPath] = mirrorResult{at: time.Now(), err: err}
 }
 
-// StoreClaudeCredentials pushes the credentials file at path into the
-// keychain, which is what makes an account switch visible to Claude Code on
-// macOS: restoring the file alone changes nothing, because the CLI reads the
-// keychain first.
-//
-// Returns nil when there is nothing to do (bridge unavailable, no such file,
-// or the file is not JSON), and an error only when the keychain write itself
-// fails — a case the caller must surface, since silently skipping it leaves
-// the previous account live.
-func StoreClaudeCredentials(path string) error {
-	if !Available() || path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil || len(data) == 0 || !json.Valid(data) {
-		return nil
-	}
-	if current, ok := ClaudeCredentials(); ok && bytesEqualJSON(current, data) {
-		return nil
-	}
-	if err := Set(ClaudeService, CurrentAccount(), data); err != nil {
-		return fmt.Errorf("store claude credentials in macOS keychain: %w", err)
-	}
-	return nil
+// forgetMirror drops the memo for credPath, so the next EnsureMirror re-reads
+// the keychain. Called whenever caam itself changes the item.
+func forgetMirror(credPath string) {
+	mirrorMu.Lock()
+	defer mirrorMu.Unlock()
+	delete(mirrorCache, credPath)
 }
 
-// ClearClaudeCredentials removes the keychain item (logout). A missing item or
-// an unavailable bridge is not an error.
-func ClearClaudeCredentials() error {
-	if !Available() {
-		return nil
-	}
-	if err := Delete(ClaudeService, CurrentAccount()); err != nil {
-		return fmt.Errorf("clear claude credentials from macOS keychain: %w", err)
-	}
-	return nil
+// ForgetMirrors clears every memoized mirror refresh. Tests call it so one
+// test's fake keychain cannot answer for the next.
+func ForgetMirrors() {
+	mirrorMu.Lock()
+	defer mirrorMu.Unlock()
+	mirrorCache = map[string]mirrorResult{}
 }
 
-// bytesEqualJSON compares two credential blobs ignoring trailing whitespace,
-// so a mirror that only differs by a trailing newline is not rewritten.
-func bytesEqualJSON(a, b []byte) bool {
-	return string(trimSpace(a)) == string(trimSpace(b))
+func ensureMirror(credPath string) (bool, error) {
+	blob, err := ReadClaude()
+	if err != nil {
+		return false, err
+	}
+	if existing, readErr := os.ReadFile(credPath); readErr == nil && bytes.Equal(bytes.TrimSpace(existing), bytes.TrimSpace(blob)) {
+		return false, nil
+	}
+	if err := writeSecretFile(credPath, blob); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func trimSpace(b []byte) []byte {
-	start, end := 0, len(b)
-	for start < end && isSpace(b[start]) {
-		start++
+// PushMirror writes credPath's contents back into the login keychain, making
+// the restored profile the account Claude Code will actually use.
+func PushMirror(credPath string) error {
+	if !Enabled() {
+		return ErrNoKeychain
 	}
-	for end > start && isSpace(b[end-1]) {
-		end--
+	blob, err := os.ReadFile(credPath)
+	if err != nil {
+		return fmt.Errorf("keychain: read %s: %w", credPath, err)
 	}
-	return b[start:end]
-}
-
-func isSpace(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+	// caam is about to change the item, so the memoized refresh no longer
+	// describes it.
+	forgetMirror(credPath)
+	return WriteClaude(bytes.TrimSpace(blob))
 }
 
 // writeSecretFile writes data to path atomically with 0600 permissions.
 func writeSecretFile(path string, data []byte) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("keychain: create %s: %w", dir, err)
 	}
-	tmp, err := os.CreateTemp(dir, ".caam-cred-*")
+	f, err := os.CreateTemp(dir, ".credentials.json.tmp.*")
 	if err != nil {
-		return err
+		return fmt.Errorf("keychain: create temp file in %s: %w", dir, err)
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	tmp := f.Name()
+	defer os.Remove(tmp)
 
-	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
-		return err
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("keychain: write %s: %w", tmp, err)
 	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return fmt.Errorf("keychain: chmod %s: %w", tmp, err)
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("keychain: sync %s: %w", tmp, err)
 	}
-	if err := tmp.Close(); err != nil {
-		return err
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("keychain: close %s: %w", tmp, err)
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("keychain: rename onto %s: %w", path, err)
+	}
+	return nil
 }
